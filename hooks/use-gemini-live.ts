@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from '@google/genai'
 import { AI_SYSTEM_INSTRUCTION, AI_TOOL_DECLARATIONS, type AiCameraActions } from '@/lib/ai-assistant'
 
-const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025'
+const LIVE_MODEL = 'gemini-2.5-flash-native-audio-latest'
 const INPUT_SAMPLE_RATE = 16000
 const OUTPUT_SAMPLE_RATE = 24000
 
@@ -60,6 +60,13 @@ export function useGeminiLive({
   const speakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mutedRef = useRef(false)
   const activeRef = useRef(false)
+  // Gate: while a tool call is pending, sending realtime input (audio/video)
+  // makes the server close the connection with error 1008. Block it.
+  const toolCallPendingRef = useRef(false)
+  // Session resumption handle so we can silently reconnect if the socket drops
+  const resumeHandleRef = useRef<string | null>(null)
+  const reconnectAttemptsRef = useRef(0)
+  const openSessionRef = useRef<(() => Promise<void>) | null>(null)
 
   useEffect(() => {
     mutedRef.current = muted
