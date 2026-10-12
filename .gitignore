@@ -12,4 +12,12 @@ __v0_jsx-dev-runtime.ts
 # Common ignores
 node_modules
 .next/
+out/
 .DS_Store
+
+# Android local configuration, credentials, and build output
+android/.gradle/
+android/**/build/
+android/local.properties
+android/**/*.jks
+android/**/*.keystore
