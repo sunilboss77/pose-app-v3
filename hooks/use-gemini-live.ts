@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from '@google/genai'
 import { AI_SYSTEM_INSTRUCTION, AI_TOOL_DECLARATIONS, type AiCameraActions } from '@/lib/ai-assistant'
+import { apiUrl, isNativeApp } from '@/lib/runtime'
 
-const LIVE_MODEL = 'gemini-2.5-flash-native-audio-latest'
+const LIVE_MODEL = process.env.NEXT_PUBLIC_GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-latest'
 const INPUT_SAMPLE_RATE = 16000
 const OUTPUT_SAMPLE_RATE = 24000
 
@@ -67,6 +68,10 @@ export function useGeminiLive({
   const resumeHandleRef = useRef<string | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const openSessionRef = useRef<(() => Promise<void>) | null>(null)
+  const mountedRef = useRef(true)
+  const nativeActiveRef = useRef(true)
+  const connectionIdRef = useRef(0)
+  const tokenAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     mutedRef.current = muted
@@ -80,6 +85,7 @@ export function useGeminiLive({
 
   const stopPlayback = useCallback(() => {
     scheduledSourcesRef.current.forEach((src) => {
+      src.onended = null
       try {
         src.stop()
       } catch {
@@ -88,11 +94,14 @@ export function useGeminiLive({
     })
     scheduledSourcesRef.current.clear()
     nextPlayTimeRef.current = 0
-    setAiSpeaking(false)
+    if (mountedRef.current) setAiSpeaking(false)
   }, [])
 
   const disconnect = useCallback(() => {
     activeRef.current = false
+    connectionIdRef.current += 1
+    tokenAbortRef.current?.abort()
+    tokenAbortRef.current = null
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current)
       frameIntervalRef.current = null
@@ -102,7 +111,10 @@ export function useGeminiLive({
       speakingTimeoutRef.current = null
     }
     stopPlayback()
-    processorRef.current?.disconnect()
+    if (processorRef.current) {
+      processorRef.current.onaudioprocess = null
+      processorRef.current.disconnect()
+    }
     processorRef.current = null
     micStreamRef.current?.getTracks().forEach((t) => t.stop())
     micStreamRef.current = null
@@ -117,8 +129,10 @@ export function useGeminiLive({
       // ignore
     }
     sessionRef.current = null
-    setStatus('idle')
-    setAiSpeaking(false)
+    if (mountedRef.current) {
+      setStatus('idle')
+      setAiSpeaking(false)
+    }
   }, [stopPlayback])
 
   const playAudioChunk = useCallback((base64: string) => {
@@ -224,21 +238,33 @@ export function useGeminiLive({
   }, [actionsRef])
 
   const connect = useCallback(async () => {
-    if (activeRef.current) return
+    if (activeRef.current || !mountedRef.current || !nativeActiveRef.current || document.hidden) return
     activeRef.current = true
+    const connectionId = ++connectionIdRef.current
+    const isCurrent = () => mountedRef.current && activeRef.current
+      && nativeActiveRef.current && !document.hidden && connectionIdRef.current === connectionId
+    const tokenAbort = new AbortController()
+    tokenAbortRef.current = tokenAbort
     setStatus('connecting')
     setErrorMsg(null)
 
     try {
       // 1. Get ephemeral token from our server (real API key stays server-side)
-      const res = await fetch('/api/ai-token', { method: 'POST' })
+      const res = await fetch(apiUrl('/api/ai-token'), { method: 'POST', signal: tokenAbort.signal })
+      if (!isCurrent()) return
       if (!res.ok) throw new Error('token failed')
       const { token } = (await res.json()) as { token: string }
+      if (!isCurrent()) return
+      tokenAbortRef.current = null
 
       // 2. Microphone
       const micStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
       })
+      if (!isCurrent()) {
+        micStream.getTracks().forEach((track) => track.stop())
+        return
+      }
       micStreamRef.current = micStream
 
       // 3. Audio contexts
@@ -250,6 +276,8 @@ export function useGeminiLive({
       gain.gain.value = speakerLoud ? 2.8 : 1
       gain.connect(outputCtx.destination)
       gainRef.current = gain
+      await Promise.all([inputCtx.resume(), outputCtx.resume()])
+      if (!isCurrent()) return
 
       // 4. Connect to Gemini Live
       const ai = new GoogleGenAI({ apiKey: token, apiVersion: 'v1alpha' })
@@ -263,10 +291,10 @@ export function useGeminiLive({
         },
         callbacks: {
           onopen: () => {
-            if (activeRef.current) setStatus('connected')
+            if (isCurrent()) setStatus('connected')
           },
           onmessage: (message: LiveServerMessage) => {
-            if (!activeRef.current) return
+            if (!isCurrent()) return
             if (message.serverContent?.interrupted) {
               stopPlayback()
               return
@@ -275,15 +303,15 @@ export function useGeminiLive({
             if (audioData) playAudioChunk(audioData)
             if (message.toolCall) handleToolCall(message)
           },
-          onerror: (e: ErrorEvent) => {
-            console.log('[v0] Gemini Live error:', e.message)
+          onerror: () => {
+            if (isCurrent()) console.log('[v0] Gemini Live error:', 'connection error')
           },
           onclose: () => {
-            if (activeRef.current) disconnect()
+            if (isCurrent()) disconnect()
           },
         },
       })
-      if (!activeRef.current) {
+      if (!isCurrent()) {
         session.close()
         return
       }
@@ -295,7 +323,7 @@ export function useGeminiLive({
       const processor = inputCtx.createScriptProcessor(4096, 1, 1)
       processorRef.current = processor
       processor.onaudioprocess = (e) => {
-        if (!activeRef.current || mutedRef.current || !sessionRef.current) return
+        if (!isCurrent() || mutedRef.current || !sessionRef.current) return
         const data = e.inputBuffer.getChannelData(0)
         try {
           sessionRef.current.sendRealtimeInput({
@@ -310,7 +338,7 @@ export function useGeminiLive({
 
       // 6. Stream camera frames (~1 fps) so the AI can see the screen
       frameIntervalRef.current = setInterval(() => {
-        if (!activeRef.current || !sessionRef.current) return
+        if (!isCurrent() || !sessionRef.current) return
         const frame = getVideoFrame()
         if (!frame) return
         try {
@@ -328,16 +356,62 @@ export function useGeminiLive({
         turnComplete: true,
       })
     } catch (err) {
-      console.log('[v0] AI connect failed:', err)
+      if (!isCurrent()) return
+      console.log('[v0] AI connect failed:', 'connection failed')
       activeRef.current = false
       disconnect()
       setStatus('error')
-      setErrorMsg('AI असिस्टेंट से कनेक्ट नहीं हो पाया। कृपया दोबारा कोशिश करें।')
+      setErrorMsg(err instanceof Error && err.name === 'NotAllowedError'
+        ? 'माइक्रोफ़ोन की अनुमति नहीं मिली। कृपया सेटिंग्स में माइक्रोफ़ोन की अनुमति दें और दोबारा कोशिश करें।'
+        : 'AI असिस्टेंट से कनेक्ट नहीं हो पाया। कृपया दोबारा कोशिश करें।')
     }
   }, [disconnect, getVideoFrame, handleToolCall, playAudioChunk, speakerLoud, stopPlayback])
 
   useEffect(() => {
+    mountedRef.current = true
+    nativeActiveRef.current = true
+    let disposed = false
+    let removeNativeListener: (() => Promise<void>) | undefined
+    const onVisibilityChange = () => {
+      if (document.hidden) disconnect()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    onVisibilityChange()
+
+    if (isNativeApp()) {
+      void (async () => {
+        try {
+          const { App } = await import('@capacitor/app')
+          if (disposed) return
+          let stateRevision = 0
+          const updateNativeState = (isActive: boolean) => {
+            if (disposed) return
+            nativeActiveRef.current = isActive
+            if (!isActive) disconnect()
+          }
+          const listener = await App.addListener('appStateChange', ({ isActive }) => {
+            stateRevision += 1
+            updateNativeState(isActive)
+          })
+          if (disposed) {
+            await listener.remove()
+            return
+          }
+          removeNativeListener = () => listener.remove()
+          const revision = stateRevision
+          const state = await App.getState()
+          if (stateRevision === revision) updateNativeState(state.isActive)
+        } catch {
+          // Web visibility handling remains available if the native bridge is unavailable.
+        }
+      })()
+    }
+
     return () => {
+      disposed = true
+      mountedRef.current = false
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      void removeNativeListener?.().catch(() => {})
       disconnect()
     }
   }, [disconnect])

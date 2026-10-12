@@ -1,6 +1,7 @@
 import { Analytics } from '@vercel/analytics/next'
 import type { Metadata, Viewport } from 'next'
 import { Poppins } from 'next/font/google'
+import { NativeBootstrap } from '@/components/native-bootstrap'
 import './globals.css'
 
 const _poppins = Poppins({ subsets: ['latin', 'devanagari'], weight: ['400', '500', '600', '700'] })
@@ -29,6 +30,10 @@ export const metadata: Metadata = {
 }
 
 export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
+  viewportFit: 'cover',
   colorScheme: 'dark',
   themeColor: '#0a0a0a',
 }
@@ -42,7 +47,8 @@ export default function RootLayout({
     <html lang="hi" className="bg-background">
       <body className="antialiased font-sans">
         {children}
-        {process.env.NODE_ENV === 'production' && <Analytics />}
+        <NativeBootstrap />
+        {process.env.NODE_ENV === 'production' && process.env.NEXT_PUBLIC_BUILD_TARGET !== 'mobile' && <Analytics />}
       </body>
     </html>
   )

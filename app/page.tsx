@@ -5,7 +5,15 @@ import { INSPIRATION_PHOTOS } from '@/lib/poses'
 
 export default function HomePage() {
   return (
-    <main className="mx-auto flex min-h-svh w-full max-w-md flex-col gap-6 px-4 pb-10 pt-12">
+    <main
+      className="mx-auto flex min-h-svh w-full max-w-md flex-col gap-6 px-4 pb-10 pt-12"
+      style={{
+        paddingTop: 'max(3rem, var(--safe-area-inset-top, env(safe-area-inset-top, 0px)))',
+        paddingBottom: 'max(2.5rem, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))',
+        paddingLeft: 'max(1rem, var(--safe-area-inset-left, env(safe-area-inset-left, 0px)))',
+        paddingRight: 'max(1rem, var(--safe-area-inset-right, env(safe-area-inset-right, 0px)))',
+      }}
+    >
       <header className="flex flex-col gap-1">
         <p className="text-sm text-muted-foreground">स्वागत है</p>
         <h1 className="text-3xl font-bold text-balance">पोज़ गाइड</h1>
@@ -48,6 +56,11 @@ export default function HomePage() {
           ))}
         </div>
       </section>
+      <footer className="text-center text-sm text-muted-foreground">
+        <Link href="/privacy" className="underline underline-offset-4">
+          प्राइवेसी पॉलिसी
+        </Link>
+      </footer>
     </main>
   )
 }

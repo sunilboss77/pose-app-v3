@@ -38,6 +38,8 @@ import { useBackgroundBlur } from '@/hooks/use-background-blur'
 import { useGeminiLive } from '@/hooks/use-gemini-live'
 import type { AiCameraActions } from '@/lib/ai-assistant'
 import { cn } from '@/lib/utils'
+import { isNativeApp } from '@/lib/runtime'
+import { savePhotoNative } from '@/lib/native-photos'
 
 type CapturedPhoto = {
   id: string
@@ -50,6 +52,8 @@ export function PoseCamera() {
 
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user')
   const [cameraError, setCameraError] = useState<string | null>(null)
+  const [cameraKey, setCameraKey] = useState(0)
+  const nativeAppActiveRef = useRef(true)
   const [activeCategory, setActiveCategory] = useState('trending')
   const [activePoseId, setActivePoseId] = useState<string | null>('trending-1')
   const [showGrid, setShowGrid] = useState(false)
@@ -70,6 +74,29 @@ export function PoseCamera() {
   const [blurEnabled, setBlurEnabled] = useState(false)
   const [fillLight, setFillLight] = useState(false)
   const [aiControlsVisible, setAiControlsVisible] = useState(true)
+  const [aiConsentOpen, setAiConsentOpen] = useState(false)
+  const aiConsentAcceptedRef = useRef(false)
+  const aiConsentDialogRef = useRef<HTMLDialogElement>(null)
+  const aiConsentReturnFocusRef = useRef<HTMLElement | null>(null)
+  const [photoToast, setPhotoToast] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!photoToast) return
+    const timeout = setTimeout(() => setPhotoToast(null), 5000)
+    return () => clearTimeout(timeout)
+  }, [photoToast])
+
+  useEffect(() => {
+    if (!aiConsentOpen) return
+    const dialog = aiConsentDialogRef.current
+    if (!dialog) return
+    const previousFocus = aiConsentReturnFocusRef.current
+    dialog.showModal()
+    return () => {
+      dialog.close()
+      if (previousFocus?.isConnected) previousFocus.focus()
+    }
+  }, [aiConsentOpen])
 
   const activePose = POSES.find((p) => p.id === activePoseId) ?? null
   const categoryPoses = POSES.filter((p) => p.category === activeCategory)
@@ -91,8 +118,20 @@ export function PoseCamera() {
 
   useEffect(() => {
     let cancelled = false
+    let requestVersion = 0
+    let removeAppListener: (() => Promise<void>) | undefined
+
+    function stopCamera() {
+      requestVersion += 1
+      streamRef.current?.getTracks().forEach((t) => t.stop())
+      streamRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+    }
 
     async function startCamera() {
+      if (cancelled || document.hidden || !nativeAppActiveRef.current) return
+      stopCamera()
+      const request = requestVersion
       try {
         setCameraError(null)
         streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -100,7 +139,7 @@ export function PoseCamera() {
           video: { facingMode },
           audio: false,
         })
-        if (cancelled) {
+        if (cancelled || request !== requestVersion || document.hidden || !nativeAppActiveRef.current) {
           stream.getTracks().forEach((t) => t.stop())
           return
         }
@@ -110,19 +149,57 @@ export function PoseCamera() {
         }
       } catch (err) {
         console.log('[v0] Camera error:', err)
-        if (!cancelled) {
+        if (!cancelled && request === requestVersion && !document.hidden && nativeAppActiveRef.current) {
           setCameraError('कैमरा एक्सेस नहीं मिला। कृपया कैमरा अनुमति दें।')
         }
       }
     }
 
-    startCamera()
+    function handleVisibilityChange() {
+      if (document.hidden) stopCamera()
+      else if (nativeAppActiveRef.current) setCameraKey((key) => key + 1)
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    if (isNativeApp()) {
+      void (async () => {
+        try {
+          const { App } = await import('@capacitor/app')
+          if (cancelled) return
+          let stateEvents = 0
+          const listener = await App.addListener('appStateChange', ({ isActive }) => {
+            if (cancelled) return
+            stateEvents += 1
+            const wasActive = nativeAppActiveRef.current
+            nativeAppActiveRef.current = isActive
+            if (!isActive) stopCamera()
+            else if (!wasActive && !document.hidden) setCameraKey((key) => key + 1)
+          })
+          if (cancelled) {
+            await listener.remove()
+            return
+          }
+          removeAppListener = () => listener.remove()
+          const stateVersion = stateEvents
+          const { isActive } = await App.getState()
+          if (cancelled) return
+          if (stateVersion === stateEvents) nativeAppActiveRef.current = isActive
+          await startCamera()
+        } catch (err) {
+          console.log('[v0] Camera app lifecycle unavailable:', err)
+          if (!cancelled) await startCamera()
+        }
+      })()
+    } else {
+      void startCamera()
+    }
     return () => {
       cancelled = true
-      streamRef.current?.getTracks().forEach((t) => t.stop())
-      streamRef.current = null
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      stopCamera()
+      void removeAppListener?.().catch((err) => console.log('[v0] Camera listener cleanup failed:', err))
     }
-  }, [facingMode])
+  }, [facingMode, cameraKey])
 
   // Check if the current frame is dark (for auto flash)
   const isFrameDark = useCallback(() => {
@@ -392,6 +469,7 @@ export function PoseCamera() {
     downloadLastPhoto: () => {
       if (photos.length === 0) return 'अभी कोई photo नहीं है, पहले photo खींचो'
       downloadPhoto(photos[0])
+      if (isNativeApp()) return 'आखिरी photo सेव करने की प्रक्रिया शुरू हो गई; नतीजा स्क्रीन पर दिखेगा'
       return 'आखिरी photo download हो गई'
     },
     getCameraStatus: () => {
@@ -419,6 +497,34 @@ export function PoseCamera() {
   }
 
   const ai = useGeminiLive({ actionsRef, getVideoFrame })
+
+  function requestAiConnection() {
+    if (ai.status === 'connecting') return
+    let accepted = aiConsentAcceptedRef.current
+    try {
+      accepted = accepted || localStorage.getItem('pose_ai_consent_v1') === 'true'
+    } catch {
+      // Consent remains valid for this camera session if storage is unavailable.
+    }
+    if (accepted) {
+      aiConsentAcceptedRef.current = true
+      ai.connect()
+    } else {
+      aiConsentReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      setAiConsentOpen(true)
+    }
+  }
+
+  function acceptAiConsent() {
+    aiConsentAcceptedRef.current = true
+    try {
+      localStorage.setItem('pose_ai_consent_v1', 'true')
+    } catch {
+      // The in-memory acceptance still allows the requested call.
+    }
+    setAiConsentOpen(false)
+    ai.connect()
+  }
 
   // WhatsApp-style auto-hide for AI call controls
   useEffect(() => {
@@ -454,7 +560,17 @@ export function PoseCamera() {
     setShowReference(true)
   }
 
-  function downloadPhoto(photo: CapturedPhoto) {
+  async function downloadPhoto(photo: CapturedPhoto) {
+    if (isNativeApp()) {
+      setPhotoToast('फोटो सेव हो रही है...')
+      const saved = await savePhotoNative(photo.dataUrl, `pose-photo-${photo.id}.jpg`, (destination) => {
+        setPhotoToast(destination === 'gallery'
+          ? 'गैलरी में सेव हो गई — Pose Guide एल्बम।'
+          : 'शेयर विकल्प खोला गया। फोटो गैलरी में सेव होने की पुष्टि नहीं हुई है।')
+      })
+      if (!saved) setPhotoToast('फोटो सेव या शेयर नहीं हो सकी। फिर से कोशिश करें।')
+      return
+    }
     const a = document.createElement('a')
     a.href = photo.dataUrl
     a.download = `pose-photo-${photo.id}.jpg`
@@ -462,9 +578,12 @@ export function PoseCamera() {
   }
 
   return (
-    <div className="relative mx-auto flex h-svh w-full max-w-md flex-col overflow-hidden bg-background">
+    <div className="relative mx-auto flex h-svh w-full max-w-md flex-col overflow-hidden bg-background" style={{
+      paddingLeft: 'var(--safe-area-inset-left, env(safe-area-inset-left, 0px))',
+      paddingRight: 'var(--safe-area-inset-right, env(safe-area-inset-right, 0px))',
+    }}>
       {/* Top bar */}
-      <header className="z-10 flex items-center justify-between px-4 py-3">
+      <header className="z-10 flex items-center justify-between px-4 py-3" style={{ paddingTop: 'calc(0.75rem + var(--safe-area-inset-top, env(safe-area-inset-top, 0px)))' }}>
         <Link
           href="/"
           className="flex size-10 items-center justify-center rounded-full text-foreground transition-colors hover:bg-accent"
@@ -744,12 +863,12 @@ export function PoseCamera() {
             onClick={(e) => {
               e.stopPropagation()
               if (ai.status === 'connecting') return
-              ai.connect()
+              requestAiConnection()
             }}
             className={cn(
               'absolute right-3 top-3 z-10 flex items-center gap-2 rounded-full bg-black/60 py-2 pl-3 pr-4 text-white shadow-lg backdrop-blur transition-colors hover:bg-black/80',
             )}
-            aria-label="AI असि���्टेंट कॉल शुरू करें"
+            aria-label="AI असिस्टेंट कॉल शुरू करें"
             disabled={ai.status === 'connecting'}
           >
             {ai.status === 'connecting' ? (
@@ -862,15 +981,22 @@ export function PoseCamera() {
 
         {/* Camera error */}
         {cameraError && (
-          <div className="absolute inset-0 flex items-center justify-center p-8">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-8">
             <p className="text-center text-base text-muted-foreground text-balance">{cameraError}</p>
+            <button
+              type="button"
+              onClick={() => setCameraKey((key) => key + 1)}
+              className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground"
+            >
+              फिर से कोशिश करें
+            </button>
           </div>
         )}
         </div>
       </div>
 
       {/* Controls */}
-      <div className="z-10 flex flex-col gap-3 pb-4 pt-3">
+      <div className="z-10 flex flex-col gap-3 pb-4 pt-3" style={{ paddingBottom: 'calc(1rem + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))' }}>
         <div className="flex items-center justify-around px-6">
           <button
             type="button"
@@ -964,7 +1090,12 @@ export function PoseCamera() {
 
       {/* Gallery sheet */}
       {galleryOpen && (
-        <div className="absolute inset-0 z-20 flex flex-col bg-background" role="dialog" aria-label="आपकी गैलरी">
+        <div className="absolute inset-0 z-20 flex flex-col bg-background" role="dialog" aria-label="आपकी गैलरी" style={{
+          paddingTop: 'var(--safe-area-inset-top, env(safe-area-inset-top, 0px))',
+          paddingBottom: 'var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))',
+          paddingLeft: 'var(--safe-area-inset-left, env(safe-area-inset-left, 0px))',
+          paddingRight: 'var(--safe-area-inset-right, env(safe-area-inset-right, 0px))',
+        }}>
           <div className="flex items-center justify-between px-4 py-3">
             <h2 className="text-lg font-semibold">आपकी गैलरी</h2>
             <button
@@ -1001,6 +1132,47 @@ export function PoseCamera() {
             </div>
           )}
         </div>
+      )}
+      {photoToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none absolute left-4 right-4 z-50 rounded-xl bg-black/85 px-4 py-3 text-center text-sm text-white shadow-lg"
+          style={{ top: 'calc(1rem + var(--safe-area-inset-top, env(safe-area-inset-top, 0px)))' }}
+        >
+          {photoToast}
+        </div>
+      )}
+      {aiConsentOpen && (
+        <dialog
+          ref={aiConsentDialogRef}
+          aria-labelledby="ai-consent-title"
+          aria-describedby="ai-consent-description"
+          onCancel={() => setAiConsentOpen(false)}
+          className="fixed inset-0 m-0 h-full max-h-none w-full max-w-none bg-black/60 p-4 text-foreground backdrop:bg-black/40 open:flex open:items-center open:justify-center"
+          style={{
+            paddingTop: 'calc(1rem + var(--safe-area-inset-top, env(safe-area-inset-top, 0px)))',
+            paddingBottom: 'calc(1rem + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))',
+            paddingLeft: 'calc(1rem + var(--safe-area-inset-left, env(safe-area-inset-left, 0px)))',
+            paddingRight: 'calc(1rem + var(--safe-area-inset-right, env(safe-area-inset-right, 0px)))',
+          }}
+        >
+          <div className="max-h-full w-full max-w-md overflow-y-auto rounded-2xl bg-background p-6 shadow-xl">
+            <h2 id="ai-consent-title" className="mb-3 text-lg font-semibold">AI असिस्टेंट</h2>
+            <p id="ai-consent-description" className="text-sm leading-relaxed">
+              AI असिस्टेंट चालू करने पर आपके माइक का ऑडियो और कैमरे के छोटे फ्रेम (लगभग हर सेकंड) रियल-टाइम में Google Gemini को भेजे जाएँगे ताकि वह आपको गाइड कर सके। आपकी फोटो आपके फोन में ही रहती हैं।
+            </p>
+            <Link href="/privacy" className="mt-4 inline-block text-sm text-primary underline">गोपनीयता नीति</Link>
+            <div className="mt-6 flex flex-wrap justify-end gap-3">
+              <button type="button" autoFocus onClick={() => setAiConsentOpen(false)} className="rounded-full bg-muted px-4 py-2 text-sm font-semibold">
+                रद्द करें
+              </button>
+              <button type="button" onClick={acceptAiConsent} className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">
+                सहमत हूँ
+              </button>
+            </div>
+          </div>
+        </dialog>
       )}
     </div>
   )

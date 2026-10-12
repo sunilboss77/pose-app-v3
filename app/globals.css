@@ -162,3 +162,14 @@
     @apply bg-background text-foreground;
   }
 }
+
+html,
+body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+}

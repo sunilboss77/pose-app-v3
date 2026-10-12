@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ImageSegmenter as ImageSegmenterType } from '@mediapipe/tasks-vision'
 
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm'
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite'
 
@@ -31,18 +31,40 @@ export function useBackgroundBlur({
     async function load() {
       try {
         const { ImageSegmenter, FilesetResolver } = await import('@mediapipe/tasks-vision')
-        const fileset = await FilesetResolver.forVisionTasks(WASM_URL)
-        const segmenter = await ImageSegmenter.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-          runningMode: 'VIDEO',
-          outputConfidenceMasks: true,
-        })
-        if (cancelled) {
-          segmenter.close()
-          return
+        let lastError: unknown
+        for (const source of [
+          { wasm: '/mediapipe/wasm', model: '/mediapipe/selfie_segmenter.tflite' },
+          { wasm: WASM_URL, model: MODEL_URL },
+        ]) {
+          if (cancelled) return
+          try {
+            const fileset = await FilesetResolver.forVisionTasks(source.wasm)
+            for (const delegate of ['GPU', 'CPU'] as const) {
+              if (cancelled) return
+              try {
+                const segmenter = await ImageSegmenter.createFromOptions(fileset, {
+                  baseOptions: { modelAssetPath: source.model, delegate },
+                  runningMode: 'VIDEO',
+                  outputConfidenceMasks: true,
+                })
+                if (cancelled) {
+                  segmenter.close()
+                  return
+                }
+                segmenterRef.current = segmenter
+                setReady(true)
+                return
+              } catch (err) {
+                lastError = err
+                console.log('[v0] Segmenter delegate failed:', source.wasm, delegate, err)
+              }
+            }
+          } catch (err) {
+            lastError = err
+            console.log('[v0] Segmenter fileset failed:', source.wasm, err)
+          }
         }
-        segmenterRef.current = segmenter
-        setReady(true)
+        throw lastError
       } catch (err) {
         console.log('[v0] Segmenter load failed:', err)
       } finally {
