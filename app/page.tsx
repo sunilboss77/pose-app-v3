@@ -2,6 +2,7 @@ import Link from 'next/link'
 import Image from 'next/image'
 import { Camera, ImageIcon, ChevronRight } from 'lucide-react'
 import { INSPIRATION_PHOTOS } from '@/lib/poses'
+import { BottomNav, PremiumBanner } from '@/components/profile-settings'
 
 export default function HomePage() {
   return (
@@ -9,7 +10,7 @@ export default function HomePage() {
       className="mx-auto flex min-h-svh w-full max-w-md flex-col gap-6 px-4 pb-10 pt-12"
       style={{
         paddingTop: 'max(3rem, var(--safe-area-inset-top, env(safe-area-inset-top, 0px)))',
-        paddingBottom: 'max(2.5rem, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))',
+        paddingBottom: 'calc(6rem + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))',
         paddingLeft: 'max(1rem, var(--safe-area-inset-left, env(safe-area-inset-left, 0px)))',
         paddingRight: 'max(1rem, var(--safe-area-inset-right, env(safe-area-inset-right, 0px)))',
       }}
@@ -18,6 +19,8 @@ export default function HomePage() {
         <p className="text-sm text-muted-foreground">स्वागत है</p>
         <h1 className="text-3xl font-bold text-balance">पोज़ गाइड</h1>
       </header>
+
+      <PremiumBanner />
 
       <Link
         href="/camera"
@@ -61,6 +64,7 @@ export default function HomePage() {
           प्राइवेसी पॉलिसी
         </Link>
       </footer>
+      <BottomNav active="home" />
     </main>
   )
 }

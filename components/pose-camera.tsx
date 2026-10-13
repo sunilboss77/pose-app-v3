@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import Link from 'next/link'
 import Image from 'next/image'
 import {
@@ -46,11 +46,61 @@ type CapturedPhoto = {
   dataUrl: string
 }
 
+type UserPhotoOverlay = {
+  id: string
+  dataUrl: string
+  naturalWidth: number
+  naturalHeight: number
+  x: number
+  y: number
+  scale: number
+  rotation: number
+  opacity: number
+}
+
+type OverlayPointer = {
+  x: number
+  y: number
+}
+
+const FILTER_ENGLISH_NAMES: Record<string, string> = {
+  normal: 'Normal',
+  warm: 'Warm',
+  cool: 'Cool',
+  golden: 'Golden Hour',
+  'teal-orange': 'Teal-Orange',
+  cinematic: 'Cinematic',
+  moody: 'Moody',
+  film: 'Film',
+  vintage: 'Vintage',
+  pastel: 'Pastel',
+  portrait: 'Portrait',
+  bw: 'B&W',
+  noir: 'Noir',
+  fresh: 'Fresh',
+}
+
 export function PoseCamera() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const photoInputRef = useRef<HTMLInputElement>(null)
+  const overlayPointersRef = useRef<Map<number, OverlayPointer>>(new Map())
+  const overlayGestureRef = useRef<{
+    mode: 'drag' | 'pinch'
+    startX: number
+    startY: number
+    startDistance: number
+    startAngle: number
+    startScale: number
+    startRotation: number
+    startOverlayX: number
+    startOverlayY: number
+  } | null>(null)
+  const filterSwipeStartRef = useRef<{ x: number; y: number } | null>(null)
+  const didFilterSwipeRef = useRef(false)
 
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user')
+  const [cameraTransitioning, setCameraTransitioning] = useState(false)
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [cameraKey, setCameraKey] = useState(0)
   const nativeAppActiveRef = useRef(true)
@@ -71,6 +121,8 @@ export function PoseCamera() {
   const [showReference, setShowReference] = useState(true)
   const [filterId, setFilterId] = useState('normal')
   const [showFilters, setShowFilters] = useState(false)
+  const [filterLabelShown, setFilterLabelShown] = useState(true)
+  const [photoOverlay, setPhotoOverlay] = useState<UserPhotoOverlay | null>(null)
   const [blurEnabled, setBlurEnabled] = useState(false)
   const [fillLight, setFillLight] = useState(false)
   const [aiControlsVisible, setAiControlsVisible] = useState(true)
@@ -117,6 +169,12 @@ export function PoseCamera() {
     .join(' ')
 
   useEffect(() => {
+    setFilterLabelShown(false)
+    const frame = requestAnimationFrame(() => setFilterLabelShown(true))
+    return () => cancelAnimationFrame(frame)
+  }, [filterId])
+
+  useEffect(() => {
     let cancelled = false
     let requestVersion = 0
     let removeAppListener: (() => Promise<void>) | undefined
@@ -130,11 +188,11 @@ export function PoseCamera() {
 
     async function startCamera() {
       if (cancelled || document.hidden || !nativeAppActiveRef.current) return
-      stopCamera()
+      const previousStream = streamRef.current
       const request = requestVersion
       try {
         setCameraError(null)
-        streamRef.current?.getTracks().forEach((t) => t.stop())
+        setCameraTransitioning(previousStream !== null)
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode },
           audio: false,
@@ -146,11 +204,23 @@ export function PoseCamera() {
         streamRef.current = stream
         if (videoRef.current) {
           videoRef.current.srcObject = stream
+          await videoRef.current.play().catch(() => undefined)
         }
+        if (cancelled || request !== requestVersion) {
+          stream.getTracks().forEach((t) => t.stop())
+          if (streamRef.current === stream) {
+            streamRef.current = previousStream
+            if (videoRef.current) videoRef.current.srcObject = previousStream
+          }
+          return
+        }
+        previousStream?.getTracks().forEach((t) => t.stop())
+        setCameraTransitioning(false)
       } catch (err) {
         console.log('[v0] Camera error:', err)
         if (!cancelled && request === requestVersion && !document.hidden && nativeAppActiveRef.current) {
           setCameraError('कैमरा एक्सेस नहीं मिला। कृपया कैमरा अनुमति दें।')
+          setCameraTransitioning(false)
         }
       }
     }
@@ -195,11 +265,18 @@ export function PoseCamera() {
     }
     return () => {
       cancelled = true
+      requestVersion += 1
       document.removeEventListener('visibilitychange', handleVisibilityChange)
-      stopCamera()
       void removeAppListener?.().catch((err) => console.log('[v0] Camera listener cleanup failed:', err))
     }
   }, [facingMode, cameraKey])
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+  }, [])
 
   // Check if the current frame is dark (for auto flash)
   const isFrameDark = useCallback(() => {
@@ -233,6 +310,147 @@ export function PoseCamera() {
       return false
     }
   }, [])
+
+  function cycleFilter(direction: 1 | -1) {
+    const currentIndex = CAMERA_FILTERS.findIndex((filter) => filter.id === filterId)
+    const nextIndex = (currentIndex + direction + CAMERA_FILTERS.length) % CAMERA_FILTERS.length
+    setFilterId(CAMERA_FILTERS[nextIndex].id)
+  }
+
+  function handleViewfinderPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    const target = event.target
+    if (target instanceof HTMLElement && target.closest('button, input, [data-overlay-interaction]')) return
+    filterSwipeStartRef.current = { x: event.clientX, y: event.clientY }
+    didFilterSwipeRef.current = false
+  }
+
+  function handleViewfinderPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = filterSwipeStartRef.current
+    filterSwipeStartRef.current = null
+    if (!start) return
+    const deltaX = event.clientX - start.x
+    const deltaY = event.clientY - start.y
+    if (Math.abs(deltaX) > 40 && Math.abs(deltaX) > Math.abs(deltaY) * 1.2) {
+      cycleFilter(deltaX < 0 ? 1 : -1)
+      didFilterSwipeRef.current = true
+    }
+  }
+
+  function openPhotoPicker() {
+    photoInputRef.current?.click()
+  }
+
+  function handlePhotoFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.currentTarget.value = ''
+    if (!file || !file.type.startsWith('image/')) return
+
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return
+      const image = new window.Image()
+      image.onload = () => {
+        setPhotoOverlay({
+          id: `${Date.now()}`,
+          dataUrl: reader.result as string,
+          naturalWidth: image.naturalWidth,
+          naturalHeight: image.naturalHeight,
+          x: 0,
+          y: 0,
+          scale: 1,
+          rotation: 0,
+          opacity: 0.8,
+        })
+      }
+      image.src = reader.result
+    }
+    reader.readAsDataURL(file)
+  }
+
+  function handleOverlayPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    event.stopPropagation()
+    if (!photoOverlay) return
+    event.currentTarget.setPointerCapture(event.pointerId)
+    overlayPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    const points = Array.from(overlayPointersRef.current.values())
+    if (points.length >= 2) {
+      const [first, second] = points
+      overlayGestureRef.current = {
+        mode: 'pinch',
+        startX: 0,
+        startY: 0,
+        startDistance: Math.hypot(second.x - first.x, second.y - first.y),
+        startAngle: Math.atan2(second.y - first.y, second.x - first.x),
+        startScale: photoOverlay.scale,
+        startRotation: photoOverlay.rotation,
+        startOverlayX: photoOverlay.x,
+        startOverlayY: photoOverlay.y,
+      }
+      return
+    }
+    overlayGestureRef.current = {
+      mode: 'drag',
+      startX: event.clientX,
+      startY: event.clientY,
+      startDistance: 0,
+      startAngle: 0,
+      startScale: photoOverlay.scale,
+      startRotation: photoOverlay.rotation,
+      startOverlayX: photoOverlay.x,
+      startOverlayY: photoOverlay.y,
+    }
+  }
+
+  function handleOverlayPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    event.stopPropagation()
+    if (!photoOverlay || !overlayPointersRef.current.has(event.pointerId)) return
+    overlayPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    const gesture = overlayGestureRef.current
+    if (!gesture) return
+    const points = Array.from(overlayPointersRef.current.values())
+    if (gesture.mode === 'pinch' && points.length >= 2) {
+      const [first, second] = points
+      const distance = Math.hypot(second.x - first.x, second.y - first.y)
+      const angle = Math.atan2(second.y - first.y, second.x - first.x)
+      const angleDelta = ((angle - gesture.startAngle + Math.PI * 3) % (Math.PI * 2)) - Math.PI
+      setPhotoOverlay((current) => current ? {
+        ...current,
+        scale: Math.max(0.45, Math.min(2.8, gesture.startScale * (distance / Math.max(1, gesture.startDistance)))),
+        rotation: gesture.startRotation + (angleDelta * 180) / Math.PI,
+      } : null)
+      return
+    }
+    if (gesture.mode === 'drag' && points.length === 1) {
+      const rect = event.currentTarget.getBoundingClientRect()
+      if (!rect.width || !rect.height) return
+      setPhotoOverlay((current) => current ? {
+        ...current,
+        x: gesture.startOverlayX + ((event.clientX - gesture.startX) / rect.width) * 100,
+        y: gesture.startOverlayY + ((event.clientY - gesture.startY) / rect.height) * 100,
+      } : null)
+    }
+  }
+
+  function handleOverlayPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    event.stopPropagation()
+    overlayPointersRef.current.delete(event.pointerId)
+    if (overlayPointersRef.current.size === 1 && photoOverlay) {
+      const [point] = Array.from(overlayPointersRef.current.values())
+      overlayGestureRef.current = {
+        mode: 'drag',
+        startX: point.x,
+        startY: point.y,
+        startDistance: 0,
+        startAngle: 0,
+        startScale: photoOverlay.scale,
+        startRotation: photoOverlay.rotation,
+        startOverlayX: photoOverlay.x,
+        startOverlayY: photoOverlay.y,
+      }
+    } else if (overlayPointersRef.current.size === 0) {
+      overlayGestureRef.current = null
+    }
+  }
 
   const takePhoto = useCallback(async () => {
     const video = videoRef.current
@@ -310,6 +528,35 @@ export function PoseCamera() {
     }
     ctx.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh)
 
+    // User-selected photo overlays are composited after the camera frame so
+    // they remain part of the downloaded photo, including mirror/zoom/filter.
+    if (photoOverlay) {
+      const overlayImage = new window.Image()
+      await new Promise<void>((resolve) => {
+        overlayImage.onload = () => resolve()
+        overlayImage.onerror = () => resolve()
+        overlayImage.src = photoOverlay.dataUrl
+        if (overlayImage.complete) resolve()
+      })
+      if (overlayImage.naturalWidth > 0 && overlayImage.naturalHeight > 0) {
+        const imageRatio = overlayImage.naturalWidth / overlayImage.naturalHeight
+        let overlayWidth = sw * 0.72 * photoOverlay.scale * zoom
+        let overlayHeight = overlayWidth / imageRatio
+        if (overlayHeight > sh * 0.72 * photoOverlay.scale * zoom) {
+          overlayHeight = sh * 0.72 * photoOverlay.scale * zoom
+          overlayWidth = overlayHeight * imageRatio
+        }
+        const overlayX = canvas.width / 2 + (photoOverlay.x / 100) * canvas.width * zoom
+        const overlayY = canvas.height / 2 + (photoOverlay.y / 100) * canvas.height * zoom
+        ctx.save()
+        ctx.globalAlpha = photoOverlay.opacity
+        ctx.translate(overlayX, overlayY)
+        ctx.rotate((photoOverlay.rotation * Math.PI) / 180)
+        ctx.drawImage(overlayImage, -overlayWidth / 2, -overlayHeight / 2, overlayWidth, overlayHeight)
+        ctx.restore()
+      }
+    }
+
     if (previewFilter && !canUseCtxFilter) {
       const matrix = cssFilterToColorMatrix(previewFilter)
       if (matrix) {
@@ -330,7 +577,7 @@ export function PoseCamera() {
     setPhotos((prev) => [{ id: `${Date.now()}`, dataUrl }, ...prev])
     setFlash(true)
     setTimeout(() => setFlash(false), 180)
-  }, [isMirrored, flashMode, facingMode, aspectRatio, zoom, previewFilter, blurReady, blurCanvasRef, isFrameDark, setTorch])
+  }, [isMirrored, flashMode, facingMode, aspectRatio, zoom, previewFilter, photoOverlay, blurReady, blurCanvasRef, isFrameDark, setTorch])
 
   const handleCapture = useCallback(() => {
     if (countdown !== null) return
@@ -538,6 +785,10 @@ export function PoseCamera() {
   }, [ai.status])
 
   function handleViewfinderTap() {
+    if (didFilterSwipeRef.current) {
+      didFilterSwipeRef.current = false
+      return
+    }
     if (ai.status === 'connected') {
       setAiControlsVisible((v) => !v)
     }
@@ -682,6 +933,15 @@ export function PoseCamera() {
         </div>
       </header>
 
+      <input
+        ref={photoInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handlePhotoFileChange}
+        className="sr-only"
+        aria-label="गैलरी से फोटो चुनें"
+      />
+
       {/* Viewfinder */}
       <div className="flex flex-1 items-center justify-center overflow-hidden bg-black">
         <div
@@ -691,16 +951,20 @@ export function PoseCamera() {
           )}
           style={aspectRatio === 'full' ? undefined : { aspectRatio: aspectRatio === '4:3' ? '3 / 4' : '9 / 16' }}
           onClick={handleViewfinderTap}
+          onPointerDown={handleViewfinderPointerDown}
+          onPointerUp={handleViewfinderPointerUp}
+          onPointerCancel={handleViewfinderPointerUp}
         >
         <video
           ref={videoRef}
           autoPlay
           playsInline
           muted
-          className={cn('size-full object-cover transition-transform duration-200', blurReady && 'opacity-0')}
+          className={cn('size-full object-cover transition-[opacity,transform] duration-300', blurReady && 'opacity-0')}
           style={{
             transform: `${isMirrored ? 'scaleX(-1) ' : ''}scale(${zoom})`,
             filter: previewFilter || undefined,
+            opacity: cameraTransitioning ? 0.84 : 1,
           }}
         />
 
@@ -717,6 +981,36 @@ export function PoseCamera() {
             filter: previewFilter || undefined,
           }}
         />
+
+        {/* Swipe the viewfinder left/right to change filters. The compact label
+            keeps the current Hindi/English filter visible during the gesture. */}
+        {!cameraError && (
+          <div
+            key={activeFilter.id}
+            className={cn(
+              'pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full bg-black/55 px-3 py-1.5 text-center text-white shadow-lg backdrop-blur transition-all duration-300',
+              filterLabelShown ? 'translate-y-0 opacity-100' : '-translate-y-2 opacity-0',
+            )}
+            role="status"
+            aria-live="polite"
+          >
+            <span className="block text-xs font-semibold">{activeFilter.label}</span>
+            <span className="block text-[10px] text-white/75">{FILTER_ENGLISH_NAMES[activeFilter.id]}</span>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation()
+            openPhotoPicker()
+          }}
+          className="absolute right-3 top-16 z-10 flex items-center gap-1.5 rounded-full bg-black/60 px-3 py-2 text-white shadow-lg backdrop-blur transition-colors hover:bg-black/80"
+          aria-label={photoOverlay ? 'गैलरी से दूसरा फोटो चुनें' : 'गैलरी से फोटो ओवरले चुनें'}
+        >
+          <ImageIcon className="size-4" aria-hidden="true" />
+          <span className="text-xs font-semibold">फोटो ओवरले</span>
+        </button>
 
         {/* Blur model loading indicator */}
         {blurEnabled && blurLoading && (
@@ -743,6 +1037,109 @@ export function PoseCamera() {
             aria-hidden="true"
             className="pointer-events-none absolute inset-0 size-full object-contain opacity-80 mix-blend-screen"
           />
+        )}
+
+        {/* Free user photo overlay. Drag with one finger; pinch to scale and
+            twist with two fingers. It follows the viewfinder zoom. */}
+        {photoOverlay && !cameraError && (
+          <div
+            data-overlay-interaction
+            className="absolute z-10 overflow-visible"
+            style={{
+              left: `calc(50% + ${isMirrored ? -photoOverlay.x : photoOverlay.x}%)`,
+              top: `calc(50% + ${photoOverlay.y}%)`,
+              width: '72%',
+              aspectRatio: `${photoOverlay.naturalWidth} / ${photoOverlay.naturalHeight}`,
+              maxHeight: '72%',
+              transform: `translate(-50%, -50%) scale(${photoOverlay.scale * zoom})${isMirrored ? ' scaleX(-1)' : ''} rotate(${photoOverlay.rotation}deg)`,
+              touchAction: 'none',
+            }}
+            onPointerDown={handleOverlayPointerDown}
+            onPointerMove={handleOverlayPointerMove}
+            onPointerUp={handleOverlayPointerUp}
+            onPointerCancel={handleOverlayPointerUp}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={photoOverlay.dataUrl} alt="आपकी फोटो ओवरले" className="size-full object-contain" style={{ opacity: photoOverlay.opacity }} />
+            <button
+              type="button"
+              data-overlay-interaction
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation()
+                setPhotoOverlay(null)
+              }}
+              className="absolute -right-2 -top-2 flex size-7 items-center justify-center rounded-full bg-black/75 text-white shadow-lg"
+              aria-label="ओवरले फोटो हटाएँ"
+            >
+              <X className="size-4" aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
+        {photoOverlay && !cameraError && (
+          <div
+            data-overlay-interaction
+            className="absolute bottom-14 left-3 z-20 flex max-w-[calc(100%-1.5rem)] items-center gap-1.5 rounded-full bg-black/65 px-2 py-1.5 text-white shadow-lg backdrop-blur"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
+            role="group"
+            aria-label="फोटो ओवरले कंट्रोल"
+          >
+            <button
+              type="button"
+              onClick={() => setPhotoOverlay((current) => current ? { ...current, scale: Math.max(0.45, current.scale - 0.1) } : null)}
+              className="flex size-7 items-center justify-center rounded-full bg-white/15 text-sm font-bold hover:bg-white/25"
+              aria-label="ओवरले छोटा करें"
+            >
+              −
+            </button>
+            <button
+              type="button"
+              onClick={() => setPhotoOverlay((current) => current ? { ...current, scale: Math.min(2.8, current.scale + 0.1) } : null)}
+              className="flex size-7 items-center justify-center rounded-full bg-white/15 text-sm font-bold hover:bg-white/25"
+              aria-label="ओवरले बड़ा करें"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              onClick={() => setPhotoOverlay((current) => current ? { ...current, rotation: current.rotation - 15 } : null)}
+              className="flex size-7 items-center justify-center rounded-full bg-white/15 text-xs font-bold hover:bg-white/25"
+              aria-label="ओवरले बाएँ घुमाएँ"
+            >
+              ↺
+            </button>
+            <button
+              type="button"
+              onClick={() => setPhotoOverlay((current) => current ? { ...current, rotation: current.rotation + 15 } : null)}
+              className="flex size-7 items-center justify-center rounded-full bg-white/15 text-xs font-bold hover:bg-white/25"
+              aria-label="ओवरले दाएँ घुमाएँ"
+            >
+              ↻
+            </button>
+            <label className="flex items-center gap-1 px-1" data-overlay-interaction>
+              <span className="sr-only">ओवरले opacity</span>
+              <input
+                type="range"
+                min="0.1"
+                max="1"
+                step="0.05"
+                value={photoOverlay.opacity}
+                onChange={(event) => setPhotoOverlay((current) => current ? { ...current, opacity: Number(event.target.value) } : null)}
+                className="w-16 accent-white"
+                aria-label="ओवरले opacity"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => setPhotoOverlay(null)}
+              className="flex size-7 items-center justify-center rounded-full bg-white/15 hover:bg-white/25"
+              aria-label="ओवरले फोटो हटाएँ"
+            >
+              <X className="size-4" aria-hidden="true" />
+            </button>
+          </div>
         )}
 
         {/* Reference photo card (top-left, like phone camera apps) */}
